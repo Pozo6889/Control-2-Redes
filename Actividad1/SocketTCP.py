@@ -109,10 +109,9 @@ class SocketTCP:
         self.destino = direccion_servidor
 
         # 3) ACK ->
-        # El servidor ya nos devolvió X+1 (su confirmación de nuestro SYN).
-        # Adoptamos ese mismo valor tal cual, sin sumarle otro 1, para que
-        # ambos lados queden exactamente sincronizados en el mismo número.
-        self.num_secuencia = info["seq"]
+        # Cada mensaje suma 1 sobre el anterior: SYN lleva x, SYN+ACK lleva
+        # x+1 y este ACK final lleva x+2. Desde aquí ambos lados parten de x+2.
+        self.num_secuencia = (info["seq"] + 1) % 256
         ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
         self.sock.sendto(ack, self.destino)
 
@@ -150,8 +149,9 @@ class SocketTCP:
         # Esperamos el ACK final del cliente (sin manejar pérdidas por ahora).
         segmento_ack, _ = conexion.sock.recvfrom(conexion._tam_buffer())
         info_ack = SocketTCP.parse_segment(segmento_ack)
-        # info_ack["ack"] debería ser True, e info_ack["seq"] debería ser
-        # igual a conexion.num_secuencia (el mismo número ya sincronizado).
+        # info_ack["ack"] debería ser True. El ACK final trae x+2, así que
+        # avanzamos nuestro número al mismo valor que ya tiene el cliente.
+        conexion.num_secuencia = (conexion.num_secuencia + 1) % 256
 
         nueva_direccion = conexion.sock.getsockname()
         return conexion, nueva_direccion
@@ -258,6 +258,70 @@ class SocketTCP:
             self.bytes_recibidos = 0
 
         return resultado
+
+    # ------------------------------------------------------------------
+    # Fin de conexión (paso 6)
+    # ------------------------------------------------------------------
+    def _enviar_hasta_respuesta(self, segmento, es_respuesta_esperada):
+        """Manda 'segmento' y lo reenvía cada vez que salta el timeout,
+        hasta que llegue un segmento que cumpla es_respuesta_esperada(info).
+        Retorna el segmento recibido ya parseado."""
+        while True:
+            self.sock.sendto(segmento, self.destino)
+            self.sock.settimeout(self.timeout)
+            try:
+                respuesta, _ = self.sock.recvfrom(self._tam_buffer())
+            except socket.timeout:
+                continue
+            finally:
+                self.sock.settimeout(None)
+
+            info = SocketTCP.parse_segment(respuesta)
+            if es_respuesta_esperada(info):
+                return info
+
+    def close(self):
+        """Lado "Host A" del cierre: el que inicia.
+
+        1. Manda FIN.
+        2. Espera FIN+ACK del otro lado (reenvía el FIN si hay timeout).
+        3. Manda el ACK final y libera el socket.
+        """
+        # 1) FIN -> y 2) <- FIN+ACK
+        fin = SocketTCP.create_segment(self.num_secuencia, fin=True)
+        info = self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"])
+
+        # Como en el video: FIN lleva seq=z, FIN+ACK lleva z+1 y el ACK
+        # final lleva z+2 (cada mensaje suma 1 sobre el anterior).
+        self.num_secuencia = (info["seq"] + 1) % 256
+
+        # 3) ACK ->
+        ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
+        self.sock.sendto(ack, self.destino)
+
+        self.sock.close()
+
+    def recv_close(self):
+        """Lado "Host B" del cierre: el que responde.
+
+        1. Espera un FIN (ignora cualquier otro segmento).
+        2. Responde FIN+ACK y espera el ACK final (reenvía si hay timeout).
+        3. Libera el socket.
+        """
+        # 1) <- FIN
+        while True:
+            segmento, _ = self.sock.recvfrom(self._tam_buffer())
+            info = SocketTCP.parse_segment(segmento)
+            if info["fin"]:
+                break
+
+        # 2) FIN+ACK -> y <- ACK
+        self.num_secuencia = (info["seq"] + 1) % 256
+        fin_ack = SocketTCP.create_segment(self.num_secuencia, fin=True, ack=True)
+        self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"])
+
+        # 3) Cerramos el socket.
+        self.sock.close()
 
 
 if __name__ == "__main__":
