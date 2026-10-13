@@ -92,26 +92,22 @@ class SocketTCP:
         3. Mandamos el ACK final para terminar el handshake.
         """
         self.destino = address
-        self.num_secuencia = random.randint(0, 100)
+        #self.num_secuencia
+        num_secuencia = random.randint(0, 100)
 
-        # 1) SYN ->
-        syn = SocketTCP.create_segment(self.num_secuencia, syn=True)
-        self.sock.sendto(syn, self.destino)
+        # SYN 
+        syn = SocketTCP.create_segment(num_secuencia, syn=True)
 
-        # 2) <- SYN+ACK
-        # (todavía no manejamos pérdidas, así que no hay timeout/reintento)
-        segmento, direccion_servidor = self.sock.recvfrom(self._tam_buffer())
-        info = SocketTCP.parse_segment(segmento)
-        # info["syn"] e info["ack"] deberían ser True en este punto.
+        # enviamos  syn con timeout en caso de que no haya respuesta
+        info, direccion_servidor = self._enviar_hasta_respuesta(syn, lambda i: i["syn"] and i["ack"] and i["seq"] == num_secuencia + 1)
+
 
         # El servidor respondió desde un socket nuevo (distinto al que
         # escuchaba originalmente), así que actualizamos el destino.
         self.destino = direccion_servidor
 
-        # 3) ACK ->
-        # Cada mensaje suma 1 sobre el anterior: SYN lleva x, SYN+ACK lleva
-        # x+1 y este ACK final lleva x+2. Desde aquí ambos lados parten de x+2.
-        self.num_secuencia = (info["seq"] + 1) % 256
+        # ACK 
+        self.num_secuencia = (num_secuencia + 2) % 256
         ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
         self.sock.sendto(ack, self.destino)
 
@@ -137,24 +133,32 @@ class SocketTCP:
         conexion.bind(("", 0))
         conexion.destino = direccion_cliente
 
-        # No inventamos un número propio al azar: confirmamos el número
-        # que mandó el cliente sumándole 1 (igual que TCP real), para que
-        # ambos lados terminen de acuerdo en el mismo valor.
-        conexion.num_secuencia = info["seq"] + 1
+        num_secuencia = info["seq"] + 1
 
         # Respondemos con SYN+ACK desde el socket nuevo.
-        syn_ack = SocketTCP.create_segment(conexion.num_secuencia, syn=True, ack=True)
-        conexion.sock.sendto(syn_ack, direccion_cliente)
+        syn_ack = SocketTCP.create_segment(num_secuencia, syn=True, ack=True)
 
-        # Esperamos el ACK final del cliente (sin manejar pérdidas por ahora).
-        segmento_ack, _ = conexion.sock.recvfrom(conexion._tam_buffer())
-        info_ack = SocketTCP.parse_segment(segmento_ack)
-        # info_ack["ack"] debería ser True. El ACK final trae x+2, así que
-        # avanzamos nuestro número al mismo valor que ya tiene el cliente.
-        conexion.num_secuencia = (conexion.num_secuencia + 1) % 256
+        
+        while True:
+            conexion.sock.sendto(syn_ack, direccion_cliente)
+            conexion.sock.settimeout(conexion.timeout)
+            try:
+                seg, _ = conexion.sock.recvfrom(conexion._tam_buffer())
+            except socket.timeout:
+                continue                            # se perdió algo: reenviamos el SYN+ACK
+            finally:
+                conexion.sock.settimeout(None)
 
-        nueva_direccion = conexion.sock.getsockname()
-        return conexion, nueva_direccion
+            i = SocketTCP.parse_segment(seg)
+            if i["syn"] or i["seq"] != num_secuencia + 1:
+                continue
+            # Llegó el ACK, o un dato con seq x+2 (el ACK se perdió pero el cliente
+            # ya envía): en ambos casos el handshake terminó. Si fue un dato, se
+            # descarta y el cliente lo reenvía solo tras su timeout.
+            break
+
+        conexion.num_secuencia = num_secuencia + 1             # x+2
+        return conexion, conexion.sock.getsockname()
 
     # ------------------------------------------------------------------
     # Stop & Wait, usado tanto por send() como por recv() (paso 5)
@@ -196,16 +200,19 @@ class SocketTCP:
         duplicados ni pérdidas en este lado: eso queda para un paso
         posterior donde sí probemos con pérdidas reales.
         """
-        segmento, _ = self.sock.recvfrom(self._tam_buffer())
-        info = SocketTCP.parse_segment(segmento)
+        while True:
+            segmento, _ = self.sock.recvfrom(self._tam_buffer())
+            info = SocketTCP.parse_segment(segmento)
 
-        ack = SocketTCP.create_segment(info["seq"], ack=True)
-        self.sock.sendto(ack, self.destino)
+            ack = SocketTCP.create_segment(info["seq"], ack=True)
+            self.sock.sendto(ack, self.destino)
 
-        # Avanzamos la secuencia esperada para el siguiente segmento.
-        self.num_secuencia = (info["seq"] + 1) % 256
+            # Si no es duplicado
+            if info["seq"] == self.num_secuencia:
+                # Avanzamos la secuencia esperada para el siguiente segmento.
+                self.num_secuencia = (info["seq"] + 1) % 256
 
-        return info["datos"]
+                return info["datos"]
 
     def send(self, message):
         """Envía 'message' (bytes) completo usando Stop & Wait.
@@ -270,7 +277,7 @@ class SocketTCP:
             self.sock.sendto(segmento, self.destino)
             self.sock.settimeout(self.timeout)
             try:
-                respuesta, _ = self.sock.recvfrom(self._tam_buffer())
+                respuesta, direccion = self.sock.recvfrom(self._tam_buffer())
             except socket.timeout:
                 continue
             finally:
@@ -278,7 +285,7 @@ class SocketTCP:
 
             info = SocketTCP.parse_segment(respuesta)
             if es_respuesta_esperada(info):
-                return info
+                return info,direccion
 
     def close(self):
         """Lado "Host A" del cierre: el que inicia.
@@ -289,7 +296,7 @@ class SocketTCP:
         """
         # 1) FIN -> y 2) <- FIN+ACK
         fin = SocketTCP.create_segment(self.num_secuencia, fin=True)
-        info = self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"])
+        info, _ = self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"])
 
         # Como en el video: FIN lleva seq=z, FIN+ACK lleva z+1 y el ACK
         # final lleva z+2 (cada mensaje suma 1 sobre el anterior).
@@ -314,6 +321,8 @@ class SocketTCP:
             info = SocketTCP.parse_segment(segmento)
             if info["fin"]:
                 break
+            # dato duplicado cuyo ACK se perdió: reenviamos el ACK
+            self.sock.sendto(SocketTCP.create_segment(info["seq"], ack=True), self.destino)
 
         # 2) FIN+ACK -> y <- ACK
         self.num_secuencia = (info["seq"] + 1) % 256
