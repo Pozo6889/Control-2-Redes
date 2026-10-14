@@ -269,16 +269,20 @@ class SocketTCP:
     # ------------------------------------------------------------------
     # Fin de conexión (paso 6)
     # ------------------------------------------------------------------
-    def _enviar_hasta_respuesta(self, segmento, es_respuesta_esperada):
+    def _enviar_hasta_respuesta(self, segmento, es_respuesta_esperada, max_timeouts=None):
         """Manda 'segmento' y lo reenvía cada vez que salta el timeout,
         hasta que llegue un segmento que cumpla es_respuesta_esperada(info).
         Retorna el segmento recibido ya parseado."""
+        timeouts = 0
         while True:
             self.sock.sendto(segmento, self.destino)
             self.sock.settimeout(self.timeout)
             try:
                 respuesta, direccion = self.sock.recvfrom(self._tam_buffer())
             except socket.timeout:
+                timeouts += 1
+                if max_timeouts is not None and timeouts >= max_timeouts:
+                    return None  
                 continue
             finally:
                 self.sock.settimeout(None)
@@ -296,15 +300,28 @@ class SocketTCP:
         """
         # 1) FIN -> y 2) <- FIN+ACK
         fin = SocketTCP.create_segment(self.num_secuencia, fin=True)
-        info, _ = self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"])
-
+        resultado= self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"], max_timeouts=3)
+        if resultado is None:
+            self.sock.close()
+            return
+        info, _ = resultado
         # Como en el video: FIN lleva seq=z, FIN+ACK lleva z+1 y el ACK
         # final lleva z+2 (cada mensaje suma 1 sobre el anterior).
         self.num_secuencia = (info["seq"] + 1) % 256
 
         # 3) ACK ->
         ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
-        self.sock.sendto(ack, self.destino)
+
+        # Enviar ACK final 3 veces
+        for _ in range(3):                          
+            self.sock.sendto(ack, self.destino)
+            self.sock.settimeout(self.timeout)
+            try:
+                self.sock.recvfrom(self._tam_buffer())
+            except socket.timeout:
+                pass
+            finally:
+                self.sock.settimeout(None)
 
         self.sock.close()
 
@@ -327,7 +344,7 @@ class SocketTCP:
         # 2) FIN+ACK -> y <- ACK
         self.num_secuencia = (info["seq"] + 1) % 256
         fin_ack = SocketTCP.create_segment(self.num_secuencia, fin=True, ack=True)
-        self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"])
+        self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"], max_timeouts=3)
 
         # 3) Cerramos el socket.
         self.sock.close()
