@@ -27,13 +27,13 @@ class CongestionControl:
             self.cwnd += self.MSS
             if self.ssthresh != None and self.cwnd >= self.ssthresh:
                 self.current_state = "congestion_avoidance"
-        if self.is_state_congestion_avoidance():
+        elif self.is_state_congestion_avoidance():
             self.cwnd += self.MSS * (1 / self.get_MSS_in_cwnd())
 
     def event_timeout(self):
-        self.ssthresh = self.cwnd /2
+        self.ssthresh = self.cwnd //2
         self.cwnd = self.MSS
-        self.current = "slow_start"
+        self.current_state = "slow_start"
 
 
     
