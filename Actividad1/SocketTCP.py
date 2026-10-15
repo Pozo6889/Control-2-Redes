@@ -1,5 +1,6 @@
 import random
 import socket
+import sys
 
 
 class SocketTCP:
@@ -10,6 +11,15 @@ class SocketTCP:
 
     # Tamaño fijo del header en bytes: 1 byte de flags + 1 byte de secuencia.
     HEADER_SIZE = 2
+
+    # Modo debug (se activa con --debug): informa por stderr cuando el código
+    # está manejando pérdidas (timeouts, reenvíos, duplicados descartados).
+    DEBUG = "--debug" in sys.argv
+
+    @staticmethod
+    def _debug(mensaje):
+        if SocketTCP.DEBUG:
+            print(f"[debug] {mensaje}", file=sys.stderr, flush=True)
 
     def __init__(self):
         # Socket UDP real que usaremos por debajo para enviar y recibir bytes.
@@ -145,18 +155,23 @@ class SocketTCP:
             try:
                 seg, _ = conexion.sock.recvfrom(conexion._tam_buffer())
             except socket.timeout:
+                SocketTCP._debug("accept: timeout esperando el ACK final, reenvío SYN+ACK")
                 continue                            # se perdió algo: reenviamos el SYN+ACK
             finally:
                 conexion.sock.settimeout(None)
 
             i = SocketTCP.parse_segment(seg)
             if i["syn"] or i["seq"] != num_secuencia + 1:
+                SocketTCP._debug("accept: llegó algo que no es el ACK final, reenvío SYN+ACK")
                 continue
             # Llegó el ACK, o un dato con seq x+2 (el ACK se perdió pero el cliente
             # ya envía): en ambos casos el handshake terminó. Si fue un dato, se
             # descarta y el cliente lo reenvía solo tras su timeout.
             break
 
+        if not i["ack"]:
+            SocketTCP._debug("accept: se perdió el ACK final, pero llegó un dato con seq=x+2: "
+                             "handshake completo; el dato se descarta y el cliente lo reenvía")
         conexion.num_secuencia = num_secuencia + 1             # x+2
         return conexion, conexion.sock.getsockname()
 
@@ -179,6 +194,7 @@ class SocketTCP:
                 segmento_ack, _ = self.sock.recvfrom(self._tam_buffer())
             except socket.timeout:
                 # No llegó el ACK a tiempo: reenviamos el mismo segmento.
+                SocketTCP._debug(f"send: timeout esperando el ACK de seq={self.num_secuencia}, reenvío")
                 continue
             finally:
                 # Volvemos a modo bloqueante para no dejar el socket con
@@ -190,6 +206,8 @@ class SocketTCP:
                 break
             # Si llegó otra cosa (por ejemplo un ACK viejo), lo ignoramos
             # y seguimos esperando/reintentando.
+            SocketTCP._debug(f"send: llegó ACK seq={info_ack['seq']} pero esperaba seq={self.num_secuencia}, "
+                             "se ignora (ACK viejo)")
 
         self.num_secuencia = (self.num_secuencia + 1) % 256
 
@@ -213,6 +231,9 @@ class SocketTCP:
                 self.num_secuencia = (info["seq"] + 1) % 256
 
                 return info["datos"]
+
+            SocketTCP._debug(f"recv: duplicado seq={info['seq']} (esperaba seq={self.num_secuencia}), "
+                             "reenvío su ACK y lo descarto")
 
     def send(self, message):
         """Envía 'message' (bytes) completo usando Stop & Wait.
@@ -281,8 +302,10 @@ class SocketTCP:
                 respuesta, direccion = self.sock.recvfrom(self._tam_buffer())
             except socket.timeout:
                 timeouts += 1
+                SocketTCP._debug(f"timeout {timeouts}: no llegó la respuesta esperada, reenvío")
                 if max_timeouts is not None and timeouts >= max_timeouts:
-                    return None  
+                    SocketTCP._debug(f"se cumplieron {timeouts} timeouts sin respuesta, me rindo")
+                    return None
                 continue
             finally:
                 self.sock.settimeout(None)
@@ -302,9 +325,11 @@ class SocketTCP:
         fin = SocketTCP.create_segment(self.num_secuencia, fin=True)
         resultado= self._enviar_hasta_respuesta(fin, lambda i: i["fin"] and i["ack"], max_timeouts=3)
         if resultado is None:
+            SocketTCP._debug("close: no llegó el FIN+ACK tras 3 timeouts, asumo que la contraparte cerró")
             self.sock.close()
             return
         info, _ = resultado
+        SocketTCP._debug("close: recibí FIN+ACK, envío el ACK final 3 veces")
         # Como en el video: FIN lleva seq=z, FIN+ACK lleva z+1 y el ACK
         # final lleva z+2 (cada mensaje suma 1 sobre el anterior).
         self.num_secuencia = (info["seq"] + 1) % 256
@@ -339,12 +364,17 @@ class SocketTCP:
             if info["fin"]:
                 break
             # dato duplicado cuyo ACK se perdió: reenviamos el ACK
+            SocketTCP._debug(f"recv_close: dato duplicado seq={info['seq']}, reenvío su ACK")
             self.sock.sendto(SocketTCP.create_segment(info["seq"], ack=True), self.destino)
+
+        SocketTCP._debug("recv_close: recibí FIN, el cierre debe completarse")
 
         # 2) FIN+ACK -> y <- ACK
         self.num_secuencia = (info["seq"] + 1) % 256
         fin_ack = SocketTCP.create_segment(self.num_secuencia, fin=True, ack=True)
-        self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"], max_timeouts=3)
+        resultado = self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"], max_timeouts=3)
+        if resultado is None:
+            SocketTCP._debug("recv_close: no llegó el ACK final tras 3 timeouts, asumo que la contraparte cerró")
 
         # 3) Cerramos el socket.
         self.sock.close()
