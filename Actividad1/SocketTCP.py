@@ -211,7 +211,7 @@ class SocketTCP:
 
         self.num_secuencia = (self.num_secuencia + 1) % 256
 
-    def _recibir_segmento_confiable(self):
+    def _recibir_segmento(self):
         """Espera un segmento de datos y responde con su ACK.
 
         Retorna solo los datos (sin el header). Por ahora no manejamos
@@ -261,7 +261,7 @@ class SocketTCP:
         """
         # Primera llamada: todavía no sabemos el largo del mensaje.
         if self.message_length is None:
-            largo_en_bytes = self._recibir_segmento_confiable()
+            largo_en_bytes = self._recibir_segmento()
             self.message_length = int.from_bytes(largo_en_bytes, byteorder="big")
 
         restante = self.message_length - self.bytes_recibidos
@@ -270,7 +270,7 @@ class SocketTCP:
         # Mientras no tengamos suficientes datos ya guardados, seguimos
         # pidiendo más segmentos a la red.
         while len(self.buffer_pendiente) < objetivo:
-            self.buffer_pendiente += self._recibir_segmento_confiable()
+            self.buffer_pendiente += self._recibir_segmento()
 
         # Entregamos como máximo 'objetivo' bytes; el resto (si el último
         # segmento traía más de lo pedido) se queda guardado para la
