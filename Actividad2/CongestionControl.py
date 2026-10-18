@@ -9,7 +9,7 @@ class CongestionControl:
         return self.cwnd
 
     def get_MSS_in_cwnd(self):
-        return int(self.cwnd // self.MSS)
+        return int(round(self.cwnd, 6) // self.MSS)
 
     def get_ssthresh(self):
         return self.ssthresh
