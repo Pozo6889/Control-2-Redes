@@ -5,11 +5,15 @@ import sys
 #Actividad 1 
 
 class SocketTCP:
-
+    # valores en binarios utilizados para flags
+    # primera cifra indica syn
+    # segunda cifra indica ack
+    # tercera cifra indica fin
     SYN = 0b001
     ACK = 0b010
     FIN = 0b100
-    HEADER_SIZE = 2
+    # Header de tamaño de 5 bytes 1 para las flags y 4 para el seq
+    HEADER_SIZE = 5
     DEBUG = "--debug" in sys.argv
 
     @staticmethod
@@ -18,7 +22,7 @@ class SocketTCP:
             print(f"[debug] {mensaje}", file=sys.stderr, flush=True)
 
     def __init__(self):
-        
+        # variables iniciales del socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.destino = None
         self.num_secuencia = 0
@@ -27,7 +31,8 @@ class SocketTCP:
         self.message_length = None
         self.bytes_recibidos = 0
         self.buffer_pendiente = b""
-    
+
+    # se crea segmento con flag, la cual indica si lleva syn, ack o fin segun la cifra del binario
     @staticmethod
     def create_segment(seq, datos=b"", syn=False, ack=False, fin=False):
         flags = 0
@@ -38,13 +43,16 @@ class SocketTCP:
         if fin:
             flags |= SocketTCP.FIN
 
-        header = bytes([flags, seq])
+        header = bytes([flags]) + (seq % 2**32).to_bytes(4, "big")
         return header + datos
 
+    # se parsea el segmento para chequear valores de syn, ack, fin
+    # los cuales se chequean mediante un & en binario
+    # ademas de separar el seq actual y los datos
     @staticmethod
     def parse_segment(segmento):
         flags = segmento[0]
-        seq = segmento[1]
+        seq = int.from_bytes(segmento[1:5], "big")
         datos = segmento[SocketTCP.HEADER_SIZE:]
 
         return {
@@ -55,24 +63,25 @@ class SocketTCP:
             "datos": datos,
         }
 
-    
     def _tam_buffer(self):
         return SocketTCP.HEADER_SIZE + self.max_paquete
 
-
+    # crea el bind para el socket de servidor/emisor
     def bind(self, address):
         self.sock.bind(address)
 
+    # receptor/cliente establece la conexion con el servidor/emisor
     def connect(self, address):
         self.destino = address
         num_secuencia = random.randint(0, 100)
         syn = SocketTCP.create_segment(num_secuencia, syn=True)
         info, direccion_servidor = self._enviar_hasta_respuesta(syn, lambda i: i["syn"] and i["ack"] and i["seq"] == num_secuencia + 1)    
         self.destino = direccion_servidor
-        self.num_secuencia = (num_secuencia + 2) % 256
+        self.num_secuencia = (num_secuencia + 2) % 2**32
         ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
         self.sock.sendto(ack, self.destino)
 
+    # servidor/emisor acpeta la conexion a receptor/cliente
     def accept(self):
         
         while True:
@@ -113,7 +122,9 @@ class SocketTCP:
         conexion.num_secuencia = num_secuencia + 1             
         return conexion, conexion.sock.getsockname()
 
-
+    # envia segmento  al destino guardado, al recibir respuesta, si se envia el ack y llega el numero de seq correcto
+    # se avanza len(datos) en el numero de secuencia
+    # en caso contrario se espera el timer y reenvia los datos
     def _enviar_segmento(self, datos):
         segmento = SocketTCP.create_segment(self.num_secuencia, datos)
 
@@ -130,25 +141,27 @@ class SocketTCP:
                 self.sock.settimeout(None)
 
             info_ack = SocketTCP.parse_segment(segmento_ack)
-            if info_ack["ack"] and info_ack["seq"] == self.num_secuencia:
+            if info_ack["ack"] and info_ack["seq"] == self.num_secuencia + len(datos):
                 break
-            SocketTCP._debug(f"send: llegó ACK seq={info_ack['seq']} pero esperaba seq={self.num_secuencia}, "
+            SocketTCP._debug(f"send: llegó ACK seq={self.num_secuencia + len(datos)} pero esperaba seq={self.num_secuencia}, "
                              "se ignora (ACK viejo)")
 
-        self.num_secuencia = (self.num_secuencia + 1) % 256
+        self.num_secuencia = (self.num_secuencia + len(datos)) % 2**32
 
+    # se recibe segmento, se envia segmento con seq + len(datos)
     def _recibir_segmento(self):
         while True:
             segmento, _ = self.sock.recvfrom(self._tam_buffer())
             info = SocketTCP.parse_segment(segmento)
 
-            ack = SocketTCP.create_segment(info["seq"], ack=True)
+            fin_segmento = info["seq"] + len(info["datos"])        
+            ack = SocketTCP.create_segment(fin_segmento, ack=True)
             self.sock.sendto(ack, self.destino)
 
             
             if info["seq"] == self.num_secuencia:
                 
-                self.num_secuencia = (info["seq"] + 1) % 256
+                self.num_secuencia = fin_segmento % 2**32
 
                 return info["datos"]
 
@@ -218,7 +231,7 @@ class SocketTCP:
         info, _ = resultado
         SocketTCP._debug("close: recibí FIN+ACK, envío el ACK final 3 veces")
         
-        self.num_secuencia = (info["seq"] + 1) % 256
+        self.num_secuencia = (info["seq"] + 1) % 2**32
         
         ack = SocketTCP.create_segment(self.num_secuencia, ack=True)
         
@@ -242,12 +255,12 @@ class SocketTCP:
                 break
             
             SocketTCP._debug(f"recv_close: dato duplicado seq={info['seq']}, reenvío su ACK")
-            self.sock.sendto(SocketTCP.create_segment(info["seq"], ack=True), self.destino)
+            self.sock.sendto(SocketTCP.create_segment(info["seq"] + len(info["datos"]), ack=True), self.destino)
 
         SocketTCP._debug("recv_close: recibí FIN, el cierre debe completarse")
 
         
-        self.num_secuencia = (info["seq"] + 1) % 256
+        self.num_secuencia = (info["seq"] + 1) % 2**32
         fin_ack = SocketTCP.create_segment(self.num_secuencia, fin=True, ack=True)
         resultado = self._enviar_hasta_respuesta(fin_ack, lambda i: i["ack"] and not i["fin"], max_timeouts=3)
         if resultado is None:
