@@ -248,73 +248,53 @@ class SocketTCP:
 
         seq_final = self.num_secuencia + sum(len(d) for d in data_list)
 
-        #creamos el socket udp y conectamos el mismo que tenemos en esta clase (socekt tcp)
         udp = SocketUDP()
         udp.socket_udp.close()
         udp.socket_udp = self.sock
         self.sock.setblocking(False)
-        udp.settimeout(self.timeout)      
+        udp.settimeout(self.timeout)
+        data_to_send = SlidingWindowCC(self.window_size, data_list, self.num_secuencia)  
 
-        reenviar_window = True
-        window = SlidingWindowCC(self.window_size, data_list, self.num_secuencia)   
-        while window.get_data(0) is not None:
-            if reenviar_window:
-                if udp.timer_list[0] is not None:   # el timer anterior ya expiró: lo reiniciamos
-                    udp.stop_timer(0)
-                for i in range(window.window_size):
-                    data = window.get_data(i)
-                    if data is None:
-                        break
-                    seg = SocketTCP.create_segment(window.get_sequence_number(i), data)
-                    udp.sendto(seg, self.destino, 0)
-                reenviar_window = False
+        current_data = data_to_send.get_data(0)
 
+
+        while current_data is not None:
+
+            envios = 0
+            for i in range(data_to_send.window_size):
+                data = data_to_send.get_data(i)
+                if data == None:
+                    break
+                seg = SocketTCP.create_segment(data_to_send.get_sequence_number(i), data)
+                udp.sendto(seg, self.destino, 0)
+                envios += 1
             try:
-                seg, _ = udp.recvfrom(self._tam_buffer())
+                mayor_ack = 0
+                for i in range(envios):
+                    respuesta, _ = udp.recvfrom(self._tam_buffer())
+                    info = SocketTCP.parse_segment(respuesta)
+                    if info["ack"] and info["seq"] > mayor_ack:
+                        mayor_ack = info["seq"]
             except TimeoutError:
-                SocketTCP._debug("send: timeout, reenvío toda la ventana")
-                reenviar_window = True
-                continue
+                SocketTCP._debug("send: timeout, reenvío desde el primer segmento sin confirmar")
+            udp.stop_timer(0)
 
-            info = SocketTCP.parse_segment(seg)
-            if not info["ack"]:
-                continue
-            ack = info["seq"]
-
+            self.sock.setblocking(True)
+            self.num_secuencia = seq_final % 2**32            
             pasos = 0
-            for i in range(window.window_size):
-                data = window.get_data(i)
+            for i in range(data_to_send.window_size):
+                data = data_to_send.get_data(i)
                 if data is None:
                     break
-                if window.get_sequence_number(i) + len(data) <= ack:
+                if data_to_send.get_sequence_number(i) + len(data) <= mayor_ack:
                     pasos += 1
                 else:
                     break
-            if pasos == 0:
-                continue
-
-            udp.stop_timer(0)
-            window.move_window(pasos)
-
-            for i in range(window.window_size - pasos, window.window_size):
-                data = window.get_data(i)
-                if data is None:
-                    break
-                seg = SocketTCP.create_segment(window.get_sequence_number(i), data)
-                udp.sendto(seg, self.destino, 0)
-
-            if window.get_data(0) is not None and udp.timer_list[0] is None:
-                seg = SocketTCP.create_segment(window.get_sequence_number(0), window.get_data(0))
-                udp.sendto(seg, self.destino, 0)
-        if udp.timer_list[0] is not None:
-            udp.stop_timer(0)
-        self.sock.setblocking(True)
-        self.num_secuencia = seq_final % 2**32
+            data_to_send.move_window(pasos)
+            current_data = data_to_send.get_data(0)
 
 
-               
-
-
+            
 
 
     def recv_using_go_back_n(self,buff_size):
