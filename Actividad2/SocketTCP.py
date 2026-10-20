@@ -232,7 +232,7 @@ class SocketTCP:
 
         seq_final = self.num_secuencia + sum(len(d) for d in data_list)
 
-        # creamos 
+        # creamos socket udp y vinculamos con esta clase
         udp = SocketUDP()
         udp.socket_udp.close()
         udp.socket_udp = self.sock
