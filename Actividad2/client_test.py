@@ -1,15 +1,17 @@
+import sys, time
 import SocketTCP
 
-IP_VM = ("127.0.0.1", 8000)
+N = int(sys.argv[1])
+usar_cc = sys.argv[2] == "cc"
+datos = bytes((i * 7 + 3) % 256 for i in range(N))
 
-client_socketTCP = SocketTCP.SocketTCP()
-client_socketTCP.connect(IP_VM)
-# test 1
-message = "Mensje de len=16".encode()
-client_socketTCP.send(message)
-# test 2
-message = "Mensaje de largo 19".encode()
-client_socketTCP.send(message)
-# test 3
-message = "Mensaje de largo 19".encode()
-client_socketTCP.send(message)
+c = SocketTCP.SocketTCP()
+c.change_congestion_control(usar_cc)
+c.connect(("127.0.0.1", 8000))
+
+t0 = time.time()
+c.send(datos, mode="go_back_n")
+t = time.time() - t0
+
+print(f"N={N} cc={usar_cc} tiempo={t:.3f}s segmentos_enviados={c.number_of_sent_segments}")
+c.close()

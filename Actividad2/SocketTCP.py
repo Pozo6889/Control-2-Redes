@@ -3,7 +3,7 @@ import socket
 import sys
 from socketUDP import SocketUDP
 from slidingWindowCC import SlidingWindowCC
-
+from CongestionControl import CongestionControl
 class SocketTCP:
     # valores en binarios utilizados para flags
     # primera cifra indica syn
@@ -32,6 +32,13 @@ class SocketTCP:
         self.bytes_recibidos = 0
         self.buffer_pendiente = b""
         self.window_size = 8
+        self.congestion_controler = CongestionControl(8)
+        self.congestion_control_on = True
+        self.number_of_sent_segments = 0
+
+    def change_congestion_control(self,value):
+        self.congestion_control_on = value
+            
 
     # se crea segmento con flag, la cual indica si lleva syn, ack o fin segun la cifra del binario
     @staticmethod
@@ -174,12 +181,17 @@ class SocketTCP:
             SocketTCP._debug(f"recv: duplicado seq={info['seq']} (esperaba seq={self.num_secuencia}), "
                              "reenvío su ACK y lo descarto")
 
-    def send(self, message, mode="stop_and_wait"):
+    def send(self, message, mode="go_back_n"):
         if mode == "stop_and_wait":
             self.send_using_stop_and_wait(message)
         elif mode == "go_back_n":
             self.send_using_go_back_n(message)
-    def recv(self, buff_size):
+    def recv(self, buff_size, mode="stop_and_wait"):
+        if mode == "stop_and_wait":
+            return self.recv_using_stop_and_wait(buff_size)
+        elif mode == "go_back_n":
+            return self.recv_using_go_back_n(buff_size)
+    def recv_using_stop_and_wait(self, buff_size):
         if self.message_length is None:
             largo_en_bytes = self._recibir_segmento()
             self.message_length = int.from_bytes(largo_en_bytes, byteorder="big")
@@ -209,11 +221,14 @@ class SocketTCP:
         for i in range(0, message_length, self.max_paquete):
             trozo = message[i:i + self.max_paquete]
             self._enviar_segmento(trozo)
-
+    def recv_using_go_back_n(self, buff_size):
+        self.recv_using_stop_and_wait(buff_size)
     def send_using_go_back_n(self,message):
         message_length = len(message)
         largo_en_bytes = message_length.to_bytes(4, byteorder="big")
-        data_list = [largo_en_bytes] + [message[i:i + self.max_paquete] for i in range(0, len(message), self.max_paquete)]
+
+        MSS = self.congestion_controler.MSS
+        data_list = [largo_en_bytes] + [message[i:i + MSS] for i in range(0, message_length, MSS)]
 
         seq_final = self.num_secuencia + sum(len(d) for d in data_list)
 
@@ -223,43 +238,83 @@ class SocketTCP:
         udp.socket_udp = self.sock
         self.sock.setblocking(False)
         udp.settimeout(self.timeout)
-        data_to_send = SlidingWindowCC(self.window_size, data_list, self.num_secuencia)  
 
-        current_data = data_to_send.get_data(0)
+        con_control = self.congestion_controler
+        con_controlON = self.congestion_control_on
+        next_seq = self.num_secuencia
+        n_acks = 0
+        n_timeouts = 0
+
+        if con_controlON:
+            window_size = con_control.get_MSS_in_cwnd()
+        else:
+            window_size = self.window_size
+        data_window = SlidingWindowCC(window_size, data_list, next_seq)
+        if con_controlON:
+            SocketTCP._debug(f"CC inicio: estado={con_control.current_state} "
+                             f"cwnd={con_control.get_cwnd()} ssthresh={con_control.get_ssthresh()} "
+                             f"window_size={window_size}")      
+
+        current_data = data_window.get_data(0)
 
 
         while current_data is not None:
 
             envios = 0
-            for i in range(data_to_send.window_size):
-                data = data_to_send.get_data(i)
+            for i in range(data_window.window_size):
+                data = data_window.get_data(i)
                 if data == None:
                     break
-                seg = SocketTCP.create_segment(data_to_send.get_sequence_number(i), data)
+                seq = data_window.get_sequence_number(i)
+                seg = SocketTCP.create_segment(seq, data)
                 udp.sendto(seg, self.destino, 0)
+                self.number_of_sent_segments += 1
                 envios += 1
+                fin_ventana = seq + len(data)
+
             try:
-                mayor_ack = 0
+                mayor_ack = data_window.get_sequence_number(0)
                 for i in range(envios):
                     respuesta, _ = udp.recvfrom(self._tam_buffer())
                     info = SocketTCP.parse_segment(respuesta)
                     if info["ack"] and info["seq"] > mayor_ack:
                         mayor_ack = info["seq"]
+
+                        if con_controlON:
+                            con_control.event_ack_received()
+                    # En este caso ya llego todo
+                    if mayor_ack >= fin_ventana:      
+                        break                            
             except TimeoutError:
                 SocketTCP._debug("send: timeout, reenvío desde el primer segmento sin confirmar")
+
+                if con_controlON:
+                    con_control.event_timeout()
+                
             udp.stop_timer(0)
-          
+
             pasos = 0
-            for i in range(data_to_send.window_size):
-                data = data_to_send.get_data(i)
+            for i in range(data_window.window_size):
+                data = data_window.get_data(i)
                 if data is None:
                     break
-                if data_to_send.get_sequence_number(i) + len(data) <= mayor_ack:
+                if data_window.get_sequence_number(i) + len(data) <= mayor_ack:
                     pasos += 1
                 else:
                     break
-            data_to_send.move_window(pasos)
-            current_data = data_to_send.get_data(0)
+            data_window.move_window(pasos)
+
+            if con_controlON:
+                window_size = con_control.get_MSS_in_cwnd()
+                data_window.update_window_size(window_size)
+                SocketTCP._debug(f"CC: estado={con_control.current_state} "
+                                 f"cwnd={con_control.get_cwnd():.2f} ssthresh={con_control.get_ssthresh()} "
+                                 f"window_size={window_size}")
+
+
+
+
+            current_data = data_window.get_data(0)
         self.sock.setblocking(True)
         self.num_secuencia = seq_final % 2**32  
 
